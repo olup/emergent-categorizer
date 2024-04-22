@@ -5,4 +5,4 @@ pydeck
 streamlit
 openai
 scikit-learn
-dotenv
+python-dotenv
