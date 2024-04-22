@@ -17,15 +17,27 @@ from streamlit.logger import get_logger
 from sklearn.cluster import KMeans
 import numpy as np
 import pandas as pd
-import openai
+from openai import OpenAI
 import os
 from dotenv import load_dotenv
 from typing import List
+import instructor
+from pydantic import BaseModel
+
+LOGGER = get_logger(__name__)
+
 
 load_dotenv()
 
 # Initialize the OpenAI client from .env
-openaiClient = openai.Client(api_key=os.getenv("OPENAI_API_KEY"))
+openaiInstructorClient = instructor.from_openai(
+    OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+)
+openaiClient = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+
+class Category(BaseModel):
+    label: str
 
 
 # Define a function to get embeddings for a list of questions, by batch of 20
@@ -42,79 +54,86 @@ def get_question_embeddings(questions):
     return embeddings
 
 
-LOGGER = get_logger(__name__)
-
-
 def run():
     st.set_page_config(
         page_title="Hello",
         page_icon="👋",
     )
 
-    st.write("# Emergent ctaegorizer")
-    st.write("This app lets you categorize questions into auto identified categories.")
+    st.write("# Emergent categorizer")
+    st.write("You don't know how to group your questions? Let the AI do it for you!")
 
     csv_file = st.file_uploader("Qurestion list (CSV - one column only)", type=["csv"])
     if csv_file is None:
         return
 
-    csv_content = csv_file.getvalue().decode("utf-8")
-    lines = csv_content.split("\n")
+    input_df = pd.read_csv(csv_file)
 
-    headers = lines[0].split(",")
-
-    lines = lines[1:]
-    st.write("Number of questions: ", len(lines))
-    content_column = st.selectbox("Content collumn", headers)
+    content_column = st.selectbox("Content collumn", options=input_df.columns)
     if content_column is None:
         return
 
-    content_column_index = headers.index(content_column)
-
-    questions = []
-    for line in lines:
-        if len(line) == 0:
-            continue
-        questions.append(line.split(",")[content_column_index])
-
-    df = pd.DataFrame(questions, columns=["question"])
+    df = pd.DataFrame()
+    df["question"] = input_df[content_column]
 
     st.table(df["question"][:10])
 
     dataset_description = st.text_input(
-        "Dataset description", "In a few word, describe the context of this dataset"
+        "Dataset description",
+        placeholder="In a few word, describe the context of this dataset",
+        help="In a few word, describe the context of this dataset",
     )
 
-    number: int = st.number_input(
+    category_count: int = st.number_input(
         "Number of categories",
         value=3,
-        placeholder="How many categories to infer from the list",
+        help="How many categories to infer from the list",
     ).__floor__()
+
+    sample_size: int = st.number_input(
+        "Number of examples to infer label",
+        value=6,
+        help="How many examples will be given to the LLM to infer the label of the category",
+    ).__floor__()
+
+    output_language = st.text_input(
+        "Output language", "FRENCH", help="The language of the output labels"
+    )
 
     run = st.button("Run")
     if run == False:
         return
 
     st.write("Embedding questions...")
-    question_embeddings = get_question_embeddings(questions)
+    question_embeddings = get_question_embeddings(df["question"].tolist())
     df["embedding"] = question_embeddings
-
     emb_matrix = np.vstack(question_embeddings)
-    st.write(emb_matrix.shape)
 
     st.write("Clustering...")
-    kmeans = KMeans(n_clusters=number, random_state=42, init="k-means++").fit(
+    kmeans = KMeans(n_clusters=category_count, random_state=42, init="k-means++").fit(
         emb_matrix
     )
     labels = kmeans.labels_
-
     df["category"] = labels
 
-    st.write("Done!")
+    st.write("Labeling...")
 
-    # ask chatgpt to label the categories
-    for i in range(number):
-        sample_size = 5
+    # build a single prompt
+    prompt = f"""
+    We are interested in a specific dataset - here is the dataset's description:
+    ---
+    {dataset_description}
+    ---
+
+    The dataset was divided into categories.
+    You are given a list of questions, randomly sampled from a category.
+    You need to come up with a label for the category.
+    Labels should be in : {output_language}.
+    Here is the sample:
+    ---
+    """
+
+    for i in range(category_count):
         if df[df["category"] == i].shape[0] < sample_size:
             sample_size = df[df["category"] == i].shape[0]
         category_questions_sample = (
@@ -122,38 +141,29 @@ def run():
             .sample(sample_size, random_state=42)
             .tolist()
         )
-        response = openaiClient.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": "system", "content": "You are a specialist analyst."},
-                {
-                    "role": "user",
-                    "content": """
-                    We are interested in a specific dataset - here is the dataset's description:
-                    ---
-                    """
-                    + dataset_description
-                    + """
-                    ---
+        prompt += "".join(f"{row}" + "\n" for row in category_questions_sample)
+        prompt += """"
+        ---
+        """
 
-                    The dataset was divided into categories.
-                    You are given a list of questions, randomly sampled from a category.
-                    You need to come up with a label for the category. You speak the language used in the dataset description.
-                    Here is the sample:
-                    ---
-                    """
-                    + "".join(f"{row}" + "\n" for row in category_questions_sample)
-                    + """"
-                    ---
-                    
-                    You will output ONLY a json object with \{ "category": "label" \} with no code fence.
-                    """,
-                },
-            ],
-        )
-        category_label = response.choices[0].message.content
-        st.write(f"{category_label}")
-        df.loc[df["category"] == i, "category_label"] = category_label
+    response = openaiInstructorClient.chat.completions.create(
+        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "You are a specialist analyst."},
+            {
+                "role": "user",
+                "content": prompt,
+            },
+        ],
+        response_model=List[Category],
+    )
+
+    st.write("Task complete")
+
+    st.table(response)
+
+    for i, category in enumerate(response):
+        df.loc[df["category"] == i, "category_label"] = category.label
 
     # download csv file
     st.download_button(
