@@ -41,11 +41,12 @@ class Category(BaseModel):
 
 
 # Define a function to get embeddings for a list of questions, by batch of 20
-def get_question_embeddings(questions):
+def get_question_embeddings(questions: list[str]):
     embeddings: List[List[float]] = []
     batch_size = 20
     for i in range(0, len(questions), batch_size):
-        batch_questions = questions[i : i + batch_size]
+        batch_questions = questions[i: i + batch_size]
+        print(batch_questions)
         response = openaiClient.embeddings.create(
             model="text-embedding-3-small", input=batch_questions
         )
@@ -63,7 +64,8 @@ def run():
     st.write("# Emergent categorizer")
     st.write("You don't know how to group your questions? Let the AI do it for you!")
 
-    csv_file = st.file_uploader("Qurestion list (CSV - one column only)", type=["csv"])
+    csv_file = st.file_uploader(
+        "Qurestion list (CSV - one column only)", type=["csv"])
     if csv_file is None:
         return
 
@@ -75,8 +77,11 @@ def run():
 
     df = pd.DataFrame()
     df["question"] = input_df[content_column]
+    df = df.dropna()
 
     st.table(df["question"][:10])
+
+    st.write(f"{len(df['question'])} questions loaded.")
 
     dataset_description = st.text_input(
         "Dataset description",
@@ -100,12 +105,19 @@ def run():
         "Output language", "FRENCH", help="The language of the output labels"
     )
 
+    print(output_language)
+    print(sample_size)
+    print(category_count)
+    print(df["question"][:10])
+
     run = st.button("Run")
     if run == False:
         return
 
     st.write("Embedding questions...")
     question_embeddings = get_question_embeddings(df["question"].tolist())
+    print(question_embeddings)
+
     df["embedding"] = question_embeddings
     emb_matrix = np.vstack(question_embeddings)
 
@@ -160,10 +172,11 @@ def run():
 
     st.write("Task complete")
 
-    st.table(response)
-
     for i, category in enumerate(response):
         df.loc[df["category"] == i, "category_label"] = category.label
+
+    # show a table with one line per category and the total number of questions in each category
+    st.write(df.groupby("category_label").agg({"question": "count"}))
 
     # download csv file
     st.download_button(
